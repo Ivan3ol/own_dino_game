@@ -12,6 +12,26 @@
     canvas { border:1px solid #ddd; border-radius:12px; width:100%; height:auto; background:#fff; }
     .hint { opacity:.7; font-size: 13px; margin-top:8px; }
     button { padding:8px 12px; border-radius:10px; border:1px solid #ddd; background:#f7f7f7; cursor:pointer; }
+
+    .touch{
+      display:none;
+      gap:12px;
+      margin-top:12px;
+      justify-content:space-between;
+    }
+    .touchBtn{
+      flex:1;
+      padding:14px 12px;
+      font-size:16px;
+      border-radius:14px;
+      border:1px solid #ddd;
+      background:#f7f7f7;
+      touch-action: manipulation;
+    }
+    @media (pointer: coarse){
+      .touch{ display:flex; }
+      .hint{ display:none; }
+    }
   </style>
 </head>
 <body>
@@ -23,7 +43,13 @@
       </div>
     </div>
     <canvas id="c" width="780" height="220"></canvas>
-    <div class="hint">Space / ↑ to jump, ↓ to duck</div>
+    <div class="hint">Space / ↑ to jump, ↓ to duck. 
+      <p>For mobiles, touch right to jump, left to duck.</p>
+    </div>
+    <div class="touch">
+      <button id="btnDuck" class="touchBtn">DUCK</button>
+      <button id="btnJump" class="touchBtn">JUMP</button>
+    </div>
   </div>
 
 <script>
@@ -534,6 +560,62 @@
   });
 
   restartBtn.addEventListener("click", reset);
+
+  // --- Mobile / touch input ---
+  const btnJump = document.getElementById("btnJump");
+  const btnDuck = document.getElementById("btnDuck");
+
+  // Prevent page scroll/zoom gestures from interfering with gameplay
+  canvas.style.touchAction = "none";
+
+  // Helper to bind "hold" behavior (duck) and "tap" behavior (jump)
+  function bindHold(el, onDown, onUp) {
+    // pointer events cover touch + pen + mouse
+    const down = (e) => { e.preventDefault(); onDown(); };
+    const up   = (e) => { e.preventDefault(); onUp(); };
+
+    el.addEventListener("pointerdown", down, { passive: false });
+    el.addEventListener("pointerup", up, { passive: false });
+    el.addEventListener("pointercancel", up, { passive: false });
+    el.addEventListener("pointerleave", up, { passive: false });
+  }
+
+  // Jump button: tap
+  btnJump?.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    jump();
+  }, { passive: false });
+
+  // Duck button: hold
+  bindHold(btnDuck, () => duck(true), () => duck(false));
+
+  // Optional: canvas “tap anywhere to jump”, “hold bottom area to duck”
+  bindHold(canvas,
+    () => {
+      // decide duck vs jump based on where the finger lands
+      // convert client coords -> canvas coords (works with CSS scaling)
+      const rect = canvas.getBoundingClientRect();
+      // use last pointer event position if available
+      // (we’ll read from a closure var set in pointerdown below)
+    },
+    () => duck(false)
+  );
+
+  // If you want the canvas zone logic, replace the above bindHold(canvas, ...) with:
+  let lastPointerY = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    lastPointerY = e.clientY - rect.top;
+    const yNorm = lastPointerY / rect.height;
+
+    // bottom 35% = duck (hold), otherwise jump
+    if (yNorm > 0.65) duck(true);
+    else jump();
+  }, { passive: false });
+
+  canvas.addEventListener("pointerup", (e) => { e.preventDefault(); duck(false); }, { passive:false });
+  canvas.addEventListener("pointercancel", (e) => { e.preventDefault(); duck(false); }, { passive:false });
 
   // Main loop
   function loop(tNow) {
