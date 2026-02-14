@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dino Runner (Local)</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, Arial; display:flex; justify-content:center; margin:24px; }
+    .wrap { width: 780px; }
+    .hud { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+    canvas { border:1px solid #ddd; border-radius:12px; width:100%; height:auto; background:#fff; }
+    .hint { opacity:.7; font-size: 13px; margin-top:8px; }
+    button { padding:8px 12px; border-radius:10px; border:1px solid #ddd; background:#f7f7f7; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hud">
+      <div><b>Score:</b> <span id="score">0</span> &nbsp; <b>Best:</b> <span id="best">0</span></div>
+      <div>
+        <button id="restart">Restart</button>
+      </div>
+    </div>
+    <canvas id="c" width="780" height="220"></canvas>
+    <div class="hint">Space / ↑ to jump, ↓ to duck</div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const scoreEl = document.getElementById("score");
+  const bestEl = document.getElementById("best");
+  const restartBtn = document.getElementById("restart");
+
+  const W = canvas.width, H = canvas.height;
+  const groundY = 170;
+
+  // Simple PRNG for repeatable-ish obstacle spacing
+  const rand = (min, max) => Math.random() * (max - min) + min;
+
+  const OBST = {
+    CACTUS_SMALL: "cactus_small",
+    CACTUS_TALL:  "cactus_tall",
+    CACTUS_WIDE:  "cactus_wide",
+    BIRD_LOW:     "bird_low",
+    BIRD_HIGH:    "bird_high",
+  };
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  const state = {
+    running: false,
+    gameOver: false,
+    tPrev: performance.now(),
+    speed: 360,          // px/s
+    accel: 10,           // speed increase per second
+    score: 0,
+    best: Number(localStorage.getItem("dino_best") || 0),
+    nextSpawnIn: 0.9,
+    obstacles: [],
+    clouds: [],
+    lastObstacleType: null,
+    frozen: false,
+    powerUps: [],
+    shieldActive: false,
+    nextPowerUpIn: 6.0,   // seconds until next shield spawn
+    scoreAcc: 0,
+  };
+
+  bestEl.textContent = state.best.toString();
+
+  const dino = {
+    x: 70,
+    y: (groundY + 44) - (16 * 4),     // top-left of sprite on ground (sprH * SPRITE_SCALE)    w: 20,
+    h: 20,
+    vy: 0,
+    feetY: groundY + 44,              // baseline where feet touch the ground line
+    gravity: 1900,
+    jumpV: -720,
+    ducking: false,
+    onGround: true,
+    fastFallMult: 2.6,   // tune 2.0–3.5
+    sprW: 16, // sprite visual size
+    sprH: 16,
+    // hitbox (in sprite pixels), will be converted to screen px via scale
+    hit: { w: 12, h: 14, offX: 2, offY: 2 },      // standing
+    hitDuck: { w: 12, h: 7, offX: 2, offY: 9 },   // half-height, LOWER part ,
+    // animation
+    pose: "run",     // run | jump | duck
+    frame: 0,
+    frameTimer: 0,
+    jumpAscFrame: 0,        // 0 or 1 chosen randomly at jump start
+  };
+
+  let prevPose = dino.pose; // define outside update in outer scope
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+      });
+  }
+
+  async function loadFrames(prefix, count) {
+    const arr = [];
+    for (let i = 0; i < count; i++) {
+      arr.push(await loadImage(`${prefix}${i}.png`));
+    }
+    return arr;
+  }
+
+  const SPRITE_SCALE = 3; // 16x16 => 64x64 on screen, tune 3..6
+
+  const anim = {
+    run: [],
+    jump: [],
+    duck: []
+  };
+
+  let assetsReady = false;
+
+  (async () => {
+    anim.run  = await loadFrames("assets/run_", 6);
+    anim.jump = await loadFrames("assets/jump_", 4);
+    anim.duck = await loadFrames("assets/duck_", 6);
+    assetsReady = true;
+  })();
+
+
+  const OB_SCALE = 1; // 1..3
+
+  const obsImgs = {
+    tall: [],
+    wide: [],
+    square: [],
+    bird: []
+  };
+
+  let obstaclesReady = false;
+
+  (async () => {
+    obsImgs.tall = [
+      await loadImage("assets/obstacles/high_obstacle_0.png"),
+      await loadImage("assets/obstacles/high_obstacle_1.png"),
+    ];
+
+    obsImgs.wide = [
+      await loadImage("assets/obstacles/wide_obstacle_0.png"),
+      await loadImage("assets/obstacles/wide_obstacle_1.png"),
+    ];
+
+    obsImgs.square = [
+      await loadImage("assets/obstacles/square_obstacle_0.png"),
+      await loadImage("assets/obstacles/square_obstacle_1.png"),
+    ];
+    obsImgs.bird = [
+      await loadImage("assets/obstacles/bird_0.png"),
+      await loadImage("assets/obstacles/bird_1.png"),
+    ];
+    obstaclesReady = true;
+  })();
+
+  const bg = {
+    layers: [
+      // back -> front
+      { src: "assets/background/far.png",      img: null, speed: 0.02, y: 0 },
+      { src: "assets/background/middle.png",   img: null, speed: 0.05, y: -70 },
+      { src: "assets/background/close.png",   img: null, speed: 0.45, y: 99 },
+    ],
+    x: [] // per-layer scroll offsets
+  };
+
+  let bgReady = false;
+
+  (async () => {
+    for (const layer of bg.layers) layer.img = await loadImage(layer.src);
+    bg.x = bg.layers.map(() => 0);
+    bgReady = true;
+  })();
+
+  const shieldImgs = [];
+  let shieldsReady = false;
+
+  (async () => {
+    shieldImgs.push(
+      await loadImage("assets/shields/shield_0.png"),
+      await loadImage("assets/shields/shield_1.png")
+    );
+    shieldsReady = true;
+  })();
+
+  function randItem(arr) {
+    return arr[(Math.random() * arr.length) | 0];
+  }
+
+  function makeObstacleSprite(kind) {
+    const groundBottom = groundY + 44;
+
+    const img = randItem(obsImgs[kind]); // <-- picks one of the two
+    const w = img.width * OB_SCALE;
+    const h = img.height * OB_SCALE;
+
+    return {
+      x: W + 10,
+      y: groundBottom - h,
+      w, h,
+      type: kind,
+      img
+    };
+  }
+
+  function reset() {
+    state.running = true;
+    state.gameOver = false;
+    state.speed = 360;
+    state.score = 0;
+    state.obstacles = [];
+    state.clouds = [];
+    state.nextSpawnIn = 0.8;
+    state.frozen = false;
+    state.powerUps = [];
+    state.shieldActive = false;
+    state.nextPowerUpIn = 4.5; // first one appears earlier after restart
+    state.scoreAcc = 0;
+    dino.y = dino.feetY - dino.sprH * SPRITE_SCALE;
+    dino.vy = 0;
+    dino.onGround = true;
+    dino.ducking = false;
+    scoreEl.textContent = "0";
+  }
+
+  function rectsOverlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function insetRect(r, padX, padY) {
+    return {
+      x: r.x + padX,
+      y: r.y + padY,
+      w: Math.max(0, r.w - padX * 2),
+      h: Math.max(0, r.h - padY * 2),
+    };
+  }
+
+  function drawHeart(ctx, cx, cy, size) {
+    const w = size;
+    const h = size;
+
+    const x = cx;
+    const y = cy;
+
+    ctx.beginPath();
+    ctx.moveTo(x, y + h * 0.25);
+
+    // left half
+    ctx.bezierCurveTo(
+      x - w * 0.50, y - h * 0.10,
+      x - w * 0.50, y + h * 0.55,
+      x,            y + h * 0.75
+    );
+
+    // right half
+    ctx.bezierCurveTo(
+      x + w * 0.50, y + h * 0.55,
+      x + w * 0.50, y - h * 0.10,
+      x,            y + h * 0.25
+    );
+
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  function getPose() {
+    if (!dino.onGround) return "jump";
+    if (dino.ducking) return "duck";
+    return "run";
+  }
+
+  function jumpFrameIndex() {
+    // If falling OR player is forcing down, show landing/fall frame
+    const descending = (dino.vy > 0) || dino.ducking;
+    return descending ? 3 : dino.jumpAscFrame; // 0 or 1 while going up
+  }
+
+  function currentFrames() {
+    const pose = getPose();
+    return anim[pose];
+  }
+
+  function currentHitbox() {
+    const hb = (dino.onGround && dino.ducking) ? dino.hitDuck : dino.hit;
+    const w = hb.w * SPRITE_SCALE;
+    const h = hb.h * SPRITE_SCALE;
+    const x = dino.x + hb.offX * SPRITE_SCALE;
+    const y = dino.y + hb.offY * SPRITE_SCALE;
+    return { x, y, w, h };
+  }
+
+  function drawLabel(text, x, y, font, textColor, bgColor, padX = 10, padY = 6, radius = 8) {
+    ctx.save();
+
+    ctx.font = font;
+
+    const m = ctx.measureText(text);
+    const w = m.width + padX * 2;
+    const h = (m.actualBoundingBoxAscent + m.actualBoundingBoxDescent) + padY * 2;
+
+    const left = x - padX;
+    const top  = y - m.actualBoundingBoxAscent - padY;
+
+    // background
+    ctx.fillStyle = bgColor;
+    roundRect(ctx, left, top, w, h, radius); // you already have roundRect()
+    ctx.fill();
+
+    // text
+    ctx.fillStyle = textColor;
+    ctx.fillText(text, x, y);
+
+    ctx.restore();
+  }
+
+  function makeBirdSprite(type) {
+    const img = randItem(obsImgs.bird);
+    const w = img.width * OB_SCALE;   // your bird files are 64x32
+    const h = img.height * OB_SCALE;
+
+    const groundBottom = groundY + 44;
+    const y = (type === OBST.BIRD_LOW)
+      ? groundBottom - h - 18
+      : groundBottom - h - 52;
+
+    return { x: W + 10, y, w, h, type, img };
+  }
+
+  function spawnObstacle() {
+    if (!obstaclesReady) return;
+    
+
+    // Difficulty scales with speed
+    const speed = state.speed;                 // px/s
+    const sNorm = clamp((speed - 360) / 520, 0, 1); // 0..1
+
+    // Choose obstacle type with weights that change over time
+    // Early game: mostly cacti. Later: birds + wider cacti + groups.
+    const choices = [];
+
+    const wSmall = 1.8 - 0.6 * sNorm;
+    const wTall  = 1.1;
+    const wWide  = 0.5 + 0.9 * sNorm;
+    const wBird  = 0.0 + 1.2 * sNorm;
+
+    choices.push([OBST.CACTUS_SMALL, wSmall]);
+    choices.push([OBST.CACTUS_TALL,  wTall]);
+    choices.push([OBST.CACTUS_WIDE,  wWide]);
+    choices.push([OBST.BIRD_LOW,     wBird * 0.7]);
+    choices.push([OBST.BIRD_HIGH,    wBird * 0.3]);
+
+    // Prevent too many birds in a row
+    if (state.lastObstacleType && state.lastObstacleType.startsWith("bird")) {
+      for (const c of choices) if (c[0].startsWith("bird")) c[1] *= 0.35;
+    }
+
+    const type = weightedPick(choices);
+    state.lastObstacleType = type;
+
+    // Sometimes spawn a group of cacti (double / triple)
+    const canGroup = !type.startsWith("bird");
+    const groupChance = 0.10 + 0.18 * sNorm;        // up to ~28%
+    const groupCount = (canGroup && Math.random() < groupChance)
+      ? (Math.random() < 0.55 ? 2 : 3)
+      : 1;
+
+    // Spawn first obstacle at screen right
+    let x = W + 10;
+
+    for (let i = 0; i < groupCount; i++) {
+      let o;
+      if (type.startsWith("bird"))        o = makeBirdSprite(type);
+      else if (type === OBST.CACTUS_TALL)      o = makeObstacleSprite("tall");
+      else if (type === OBST.CACTUS_WIDE) o = makeObstacleSprite("wide");
+      else o = makeObstacleSprite("square"); // or map CACTUS_SMALL to square for now
+
+      o.x = x;
+      state.obstacles.push(o);
+
+      // Within-group spacing (tight but jumpable)
+      const intraGap = rand(16, 26) + 20 * sNorm;   // px
+      x += o.w + intraGap;
+    }
+
+    // Next gap is measured in "time", but depends on speed and obstacle difficulty
+    // Faster speed => smaller time gap, but larger pixel gap to keep fairness.
+    const basePixelGap = lerp(260, 360, sNorm);     // pixels between groups
+    const typePenalty =
+      type === OBST.CACTUS_WIDE ? 40 :
+      type.startsWith("bird")   ? 55 :
+      0;
+
+    // If we spawned a group, give a bit more breathing room after it
+    const groupPenalty = (groupCount - 1) * 55;
+
+    // Randomness
+    const jitter = rand(-40, 60);
+
+    const EASY_GAP_MULT = 1.35;          // 1.15–1.8 (bigger = fewer obstacles)
+    const MIN_GAP = 280;                // raises the absolute minimum
+    const MAX_GAP = 720;                // allows very large breaks
+
+    const pixelGap = clamp(
+      (basePixelGap + typePenalty + groupPenalty + jitter) * EASY_GAP_MULT,
+      MIN_GAP,
+      MAX_GAP
+    );
+
+    // Convert pixel gap to seconds based on current speed:
+    state.nextSpawnIn = pixelGap / speed;
+
+    // Occasionally spawn a cloud right after obstacle spawn (visual variety)
+    if (state.clouds.length < 6 && Math.random() < 0.35) spawnCloud();
+  }
+
+  function spawnShield() {
+    if (!shieldsReady) return;
+
+    const img = randItem(shieldImgs);
+    const s = {
+      kind: "shield",
+      img,
+      w: 32, h: 32,
+      x: W + 10,
+      y: groundY + 44 - 32, // sits on ground; adjust if needed
+    };
+
+    state.powerUps.push(s);
+  }
+
+  // Optional: time between spawns (bigger = rarer)
+  function scheduleNextShield() {
+    state.nextPowerUpIn = rand(7.0, 18.0); // tune difficulty
+  }
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function weightedPick(items) {
+    // items: [value, weight]
+    let total = 0;
+    for (const [, w] of items) total += Math.max(0, w);
+    let r = Math.random() * total;
+    for (const [v, w] of items) {
+      r -= Math.max(0, w);
+      if (r <= 0) return v;
+    }
+    return items[0][0];
+  }
+
+  function makeObstacle(type) {
+    // Returns {x,y,w,h,type}
+    if (type === OBST.BIRD_LOW || type === OBST.BIRD_HIGH) {
+      const w = 34, h = 20;
+      const y = (type === OBST.BIRD_LOW)
+        ? groundY + (44 - h) - 18   // low bird: requires duck or tight jump timing
+        : groundY + (44 - h) - 52;  // high bird: jump under it or just run
+      return { x: W + 10, y, w, h, type };
+    }
+
+    // Cacti
+    if (type === OBST.CACTUS_WIDE) {
+      const w = 34, h = 42;
+      return { x: W + 10, y: groundY + (44 - h), w, h, type };
+    }
+
+    const tall = (type === OBST.CACTUS_TALL);
+    const w = tall ? 22 : 18;
+    const h = tall ? 54 : 34;
+    return { x: W + 10, y: groundY + (44 - h), w, h, type };
+  }
+
+  function spawnCloud() {
+    state.clouds.push({
+      x: W + 20,
+      y: rand(20, 85),
+      w: rand(38, 65),
+      h: rand(14, 22),
+      v: rand(25, 45)
+    });
+  }
+
+  function setBestIfNeeded() {
+    if (state.score > state.best) {
+      state.best = state.score;
+      localStorage.setItem("dino_best", String(state.best));
+      bestEl.textContent = String(state.best);
+    }
+  }
+
+  function jump() {
+    if (!state.running) reset();
+    if (state.gameOver) { reset(); return; }
+    if (dino.onGround) {
+      dino.vy = dino.jumpV;
+      dino.onGround = false;
+      dino.jumpAscFrame = (Math.random() < 0.5) ? 0 : 1;
+    }
+  }
+
+  function duck(on) {
+    dino.ducking = on;
+  }
+
+  function drawTiledLayer(img, y, offsetX) {
+    const w = img.width, h = img.height;
+    // draw twice to cover the canvas (tile wrap)
+    const x1 = -offsetX;
+    ctx.drawImage(img, x1, y, w, h);
+    ctx.drawImage(img, x1 + w, y, w, h);
+    // if your canvas is wider than 2 tiles, draw a 3rd
+    if (x1 + 2*w < W) ctx.drawImage(img, x1 + 2*w, y, w, h);
+  }
+
+  // Input
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); jump(); }
+    if (e.code === "ArrowDown") { e.preventDefault(); duck(true); }
+    if (e.code === "KeyR") reset();
+  });
+
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "ArrowDown") duck(false);
+  });
+
+  restartBtn.addEventListener("click", reset);
+
+  // Main loop
+  function loop(tNow) {
+    const dt = Math.min(0.033, (tNow - state.tPrev) / 1000); // clamp for tab switches
+    state.tPrev = tNow;
+
+    update(dt);
+    draw();
+
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt) {
+    if (!state.running) return;
+    if (state.frozen) return; 
+    
+    if (!state.gameOver) {
+      state.speed += state.accel * dt;
+      // Score: +1 per ~0.1s scaled by speed a bit
+      state.scoreAcc += (dt * 10) * (state.speed / 1500);   // keep fraction
+      state.score = Math.floor(state.scoreAcc);            // show int
+      scoreEl.textContent = String(state.score);
+    }
+
+    // Dino physics
+    const baseH = 44;
+    const duckH = 28;
+    dino.h = dino.ducking && dino.onGround ? duckH : baseH;
+
+    if (!dino.onGround) {
+      const g = dino.gravity * (dino.ducking ? dino.fastFallMult : 1);
+      dino.vy += g * dt;
+      dino.y += dino.vy * dt;
+
+      const groundTop = dino.feetY - dino.sprH * SPRITE_SCALE;
+      if (dino.y >= groundTop) {
+        dino.y = groundTop;
+        dino.vy = 0;
+        dino.onGround = true;
+      }
+    }
+
+    if (assetsReady && !state.gameOver && !state.frozen) {
+      const pose = getPose();
+      if (pose !== "jump") {
+        const frames = currentFrames();
+        if (frames.length) {
+          // frame rates (seconds per frame)
+          const spf =
+            pose === "run"  ? 0.07 :
+            pose === "duck" ? 0.06 :
+            0.09; // jump
+
+          dino.frameTimer += dt;
+          while (dino.frameTimer >= spf) {
+            dino.frameTimer -= spf;
+            dino.frame = (dino.frame + 1) % frames.length;
+          }
+        }      
+      }
+    }
+
+    const poseNow = getPose();
+    if (poseNow !== prevPose) {
+      dino.frame = 0;
+      dino.frameTimer = 0;
+      prevPose = poseNow;
+    }
+
+    // Power-up spawn timer
+    state.nextPowerUpIn -= dt;
+    if (!state.gameOver && !state.frozen && state.nextPowerUpIn <= 0) {
+      if (!state.shieldActive)  spawnShield();
+      scheduleNextShield();
+    }
+    // Move power-ups (use same speed as obstacles so it feels consistent)
+    for (const p of state.powerUps) p.x -= state.speed * dt;
+    state.powerUps = state.powerUps.filter(p => p.x + p.w > -30);
+
+    const dinoBoxPU = currentHitbox();
+    for (let i = state.powerUps.length - 1; i >= 0; i--) {
+      const p = state.powerUps[i];
+      if (rectsOverlap(dinoBoxPU, p)) {
+        if (p.kind === "shield" && !state.shieldActive) {
+          state.shieldActive = true;
+        }
+        // remove power-up once touched
+        state.powerUps.splice(i, 1);
+      }
+    }
+
+    // Spawn clouds occasionally
+    if (state.clouds.length < 6 && Math.random() < 0.015) spawnCloud();
+
+    // Move clouds
+    for (const c of state.clouds) c.x -= c.v * dt;
+    state.clouds = state.clouds.filter(c => c.x + c.w > -20);
+
+    // Spawn obstacles
+    state.nextSpawnIn -= dt;
+    if (!state.gameOver && state.nextSpawnIn <= 0) spawnObstacle();
+
+    // Move obstacles
+    for (const o of state.obstacles) o.x -= state.speed * dt;
+    state.obstacles = state.obstacles.filter(o => o.x + o.w > -30);
+
+    if (bgReady && !state.frozen && state.running) {
+      for (let i = 0; i < bg.layers.length; i++) {
+        bg.x[i] += state.speed * bg.layers[i].speed * dt;
+        const w = bg.layers[i].img.width;
+        // keep in [-w, 0] to avoid huge numbers
+        bg.x[i] = ((bg.x[i] % w) + w) % w;
+      }
+    }
+
+    // Collision
+    if (!state.gameOver) {
+      const rawDino = { x: dino.x, y: dino.y, w: dino.w, h: dino.h };
+
+      // tune these
+      const dinoPadX = 6;
+      const dinoPadY = 6;
+
+      for (let i = 0; i < state.obstacles.length; i++) {
+        const o = state.obstacles[i];
+        const rawObs = { x: o.x, y: o.y, w: o.w, h: o.h };
+
+        // obstacles can be slightly “forgiving” too
+        const obsPadX = o.type?.startsWith("bird") ? 5 : 4;
+        const obsPadY = o.type?.startsWith("bird") ? 5 : 3;
+
+        const dinoBox = currentHitbox();
+        const obsBox  = insetRect(rawObs,  obsPadX,  obsPadY);
+
+        if (rectsOverlap(dinoBox, obsBox)) {
+          if (state.shieldActive) {
+            // Rule 5: both shield and obstacle disappear
+            state.shieldActive = false;
+            state.obstacles.splice(i, 1);
+            i--; // adjust index after removal
+            // Do NOT game over
+            continue;
+          } else {
+            state.gameOver = true;
+            state.frozen = true;
+            setBestIfNeeded();
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  function drawDino() {
+    if (!assetsReady) return;
+
+    const pose = getPose();
+    const frames = anim[pose];
+
+    let img;
+    if (pose === "jump") {
+      img = frames[jumpFrameIndex()];
+    } else {
+      img = frames[dino.frame % frames.length];
+    }
+
+    const drawW = dino.sprW * SPRITE_SCALE;
+    const drawH = dino.sprH * SPRITE_SCALE;
+    const isDucking = pose === "duck" && dino.onGround;
+
+    const drawX = dino.x;
+    const drawY = dino.y + (isDucking ? (drawH / 4) : 0);;
+    ctx.drawImage(img, drawX, drawY, drawW, drawH);
+
+    // Shield circle (if you have shield)
+    if (state.shieldActive) {
+      const cx = drawX + drawW / 2;
+      const cy = drawY - drawH / 2 - 10 ;
+      const size = Math.max(drawW, drawH) * 2.5;
+
+      ctx.save();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "#e800bf"; // pick any
+
+      drawHeart(ctx, cx, cy, size);
+      ctx.restore();
+    }
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.imageSmoothingEnabled = false;
+
+    if (bgReady) {
+      ctx.imageSmoothingEnabled = false; // crisp pixel layers
+      for (let i = 0; i < bg.layers.length; i++) {
+        drawTiledLayer(bg.layers[i].img, bg.layers[i].y, bg.x[i]);
+      }
+    } else {
+      // fallback background
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // Clouds
+    ctx.fillStyle = "#cfcfcf";
+    for (const c of state.clouds) {
+      roundRect(ctx, c.x, c.y, c.w, c.h, 8);
+      ctx.fill();
+    }
+
+    // Obstacles
+    for (const o of state.obstacles) {
+      if (o.img) {
+        ctx.drawImage(o.img, o.x, o.y, o.w, o.h);
+      } else {
+        // fallback if some obstacle was created without sprite
+        ctx.fillStyle = "#111";
+        roundRect(ctx, o.x, o.y, o.w, o.h, 4);
+        ctx.fill();
+      }
+    }
+
+    for (const p of state.powerUps) {
+      if (p.kind === "shield") {
+        // simple shield icon: circle + dot
+        ctx.drawImage(p.img, p.x, p.y, p.w, p.h);
+      }
+    }
+
+    // Dino
+    drawDino();
+
+    if (state.shieldActive) {
+      const cx = dino.x + dino.w / 2;
+      const cy = dino.y + (44 - dino.h) + dino.h / 2;
+      const r = Math.max(dino.w, dino.h) * 0.75;
+
+      ctx.strokeStyle = "#111";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Text overlays
+    if (!state.running) {
+      drawLabel(
+        "Press Space to start",
+        300, 110,
+        "16px system-ui, Arial",
+        "#000",
+        "rgba(255,255,255,0.75)"   // background
+      );
+    }
+
+    if (state.gameOver) {
+      drawLabel(
+        "Game Over — press Space to restart",
+        225, 110,
+        "20px system-ui, Arial",
+        "#b00020",
+        "rgba(255,255,255,0.80)"
+      );
+    }
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  }
+
+  // Start paused until user jumps
+  state.running = false;
+  requestAnimationFrame(loop);
+
+  // Start on first input (without auto-starting audio etc.)
+  const startOnFirstJump = (e) => {
+    if (e.code === "Space" || e.code === "ArrowUp") {
+      state.running = true;
+      window.removeEventListener("keydown", startOnFirstJump);
+    }
+  };
+  window.addEventListener("keydown", startOnFirstJump);
+})();
+</script>
+</body>
+</html>
